@@ -130,23 +130,28 @@ impl FromPyObject<'_, '_> for PyValueVariants {
     fn extract(value: Borrowed<'_, '_, PyAny>) -> PyResult<Self> {
         #[derive(FromPyObject)]
         enum Helper {
+            // Bool must come before Integer: Python's `bool` is a subclass of
+            // `int`, so `Integer` would capture `True` as `1` and `Bool` would
+            // never be reached. `bool` extraction only accepts real Python
+            // bools, so plain integers still become `Integer`.
+            // Mirrors the order used by `PyValue::extract` in `types/value.rs`.
+            Bool(bool),
             String(String),
             Integer(IntPayloadType),
-            Bool(bool),
         }
 
         fn _variants(value: ValueVariants) {
             match value {
+                ValueVariants::Bool(_) => {}
                 ValueVariants::String(_) => {}
                 ValueVariants::Integer(_) => {}
-                ValueVariants::Bool(_) => {}
             }
         }
 
         let value = match value.extract()? {
+            Helper::Bool(bool) => ValueVariants::Bool(bool),
             Helper::String(str) => ValueVariants::String(str),
             Helper::Integer(int) => ValueVariants::Integer(int),
-            Helper::Bool(bool) => ValueVariants::Bool(bool),
         };
 
         Ok(Self(value))
@@ -492,4 +497,45 @@ where
     }
 
     Ok(list.into_any())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression test for <https://github.com/qdrant/qdrant/issues/10846>.
+    ///
+    /// Python's `bool` is a subclass of `int`, so `bool` must be tried before
+    /// `Integer` during extraction; otherwise `MatchValue(value=True)` stores
+    /// `1` and boolean filters never match.
+    #[test]
+    fn match_value_bool_is_not_coerced_to_int() {
+        Python::attach(|py| {
+            let extracted = PyValueVariants::extract(
+                true.into_pyobject(py).unwrap().as_any().as_borrowed(),
+            )
+            .unwrap();
+            assert!(matches!(extracted.0, ValueVariants::Bool(true)));
+
+            let extracted = PyValueVariants::extract(
+                false.into_pyobject(py).unwrap().as_any().as_borrowed(),
+            )
+            .unwrap();
+            assert!(matches!(extracted.0, ValueVariants::Bool(false)));
+
+            // Plain integers must still extract as Integer, not Bool: pyo3's
+            // `bool` extraction only accepts real Python bools.
+            let extracted = PyValueVariants::extract(
+                1i64.into_pyobject(py).unwrap().as_any().as_borrowed(),
+            )
+            .unwrap();
+            assert!(matches!(extracted.0, ValueVariants::Integer(1)));
+
+            let extracted = PyValueVariants::extract(
+                "value".into_pyobject(py).unwrap().as_any().as_borrowed(),
+            )
+            .unwrap();
+            assert!(matches!(extracted.0, ValueVariants::String(_)));
+        });
+    }
 }
