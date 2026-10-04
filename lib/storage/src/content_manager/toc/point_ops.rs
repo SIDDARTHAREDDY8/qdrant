@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::time::Duration;
 
 use collection::collection::Collection;
@@ -22,7 +23,7 @@ use common::counter::hardware_accumulator::HwMeasurementAcc;
 use futures::TryStreamExt as _;
 use futures::stream::FuturesUnordered;
 use segment::data_types::facets::{FacetParams, FacetResponse};
-use segment::types::{ScoredPoint, ShardKey};
+use segment::types::{PointIdType, ScoredPoint, ShardKey, WithPayloadInterface, WithVector};
 use shard::retrieve::record_internal::RecordInternal;
 use shard::scroll::ScrollRequestInternal;
 use shard::search::CoreSearchRequestBatch;
@@ -480,6 +481,74 @@ impl TableOfContent {
             .map_err(StorageError::from)
     }
 
+    /// Split a point-ID-based update operation into per-shard-key variants, so
+    /// that each shard key only receives the point IDs that actually live
+    /// under it.
+    ///
+    /// `ids_per_key` maps every selected shard key to the requested point IDs
+    /// that were found under it. Shard keys with no matching IDs are skipped.
+    /// Returns `Err(missed_point_id)` for operations that fail on missing
+    /// points (payload and vector updates) when a requested ID was not found
+    /// under any of the selected shard keys, so the failure is reported
+    /// honestly instead of surfacing as a false `not found` after partial
+    /// writes.
+    fn split_operation_per_shard_key(
+        operation: &CollectionUpdateOperations,
+        ids_per_key: &[(ShardKey, HashSet<PointIdType>)],
+    ) -> Result<Vec<(ShardKey, CollectionUpdateOperations)>, PointIdType> {
+        // Not a point-ID-based operation (e.g. filter-based) or one that can
+        // create points (e.g. upserts): dispatch the full operation to every
+        // shard key, as before.
+        let full_dispatch = || {
+            ids_per_key
+                .iter()
+                .map(|(shard_key, _)| (shard_key.clone(), operation.clone()))
+                .collect()
+        };
+
+        let Some(point_ids) = operation.point_ids() else {
+            return Ok(full_dispatch());
+        };
+        if operation.upsert_point_ids().is_some() || point_ids.is_empty() {
+            return Ok(full_dispatch());
+        }
+
+        // Payload and vector updates fail on missing points, so a requested ID
+        // that lives in none of the selected shard keys is a genuine not
+        // found. Deletes of missing points are a no-op and keep the previous
+        // behavior instead of surfacing a new error.
+        if matches!(
+            operation,
+            CollectionUpdateOperations::PayloadOperation(_)
+                | CollectionUpdateOperations::VectorOperation(_)
+        ) {
+            let found_point_ids: HashSet<_> = ids_per_key
+                .iter()
+                .flat_map(|(_, key_point_ids)| key_point_ids.iter().copied())
+                .collect();
+            if let Some(missed_point_id) = point_ids
+                .iter()
+                .copied()
+                .find(|point_id| !found_point_ids.contains(point_id))
+            {
+                return Err(missed_point_id);
+            }
+        }
+
+        let mut operations_per_key = Vec::with_capacity(ids_per_key.len());
+        for (shard_key, key_point_ids) in ids_per_key {
+            let mut operation_for_key = operation.clone();
+            operation_for_key.retain_point_ids(|point_id| key_point_ids.contains(point_id));
+            if operation_for_key
+                .point_ids()
+                .is_some_and(|point_ids| !point_ids.is_empty())
+            {
+                operations_per_key.push((shard_key.clone(), operation_for_key));
+            }
+        }
+        Ok(operations_per_key)
+    }
+
     /// # Cancel safety
     ///
     /// This method is cancel safe.
@@ -497,11 +566,75 @@ impl TableOfContent {
     ) -> StorageResult<UpdateResult> {
         // `Collection::update_from_client` is cancel safe, so this method is cancel safe.
 
-        let updates: FuturesUnordered<_> = shard_keys
+        // For point-ID-based updates, find out which of the requested point
+        // IDs live under each shard key, so that each key only receives its
+        // own IDs. Dispatching the full ID list to every key made each replica
+        // set report a false `No point with id ... found` for IDs owned by
+        // other shard keys, even though the update had already been applied
+        // there (see <https://github.com/qdrant/qdrant/issues/10064>).
+        let mut operations_per_key = Vec::with_capacity(shard_keys.len());
+        let explicit_point_ids = operation.point_ids();
+        let can_create_points = operation.upsert_point_ids().is_some();
+
+        if let Some(point_ids) = explicit_point_ids
+            && !can_create_points
+            && !point_ids.is_empty()
+        {
+            let lookups: FuturesUnordered<_> = shard_keys
+                .iter()
+                .cloned()
+                .map(|shard_key| {
+                    let point_ids = point_ids.clone();
+                    let hw_measurement_acc = hw_measurement_acc.clone();
+                    async move {
+                        let shard_selector = ShardSelectorInternal::ShardKey(shard_key.clone());
+                        let records = collection
+                            .retrieve(
+                                PointRequestInternal {
+                                    ids: point_ids,
+                                    with_payload: Some(WithPayloadInterface::Bool(false)),
+                                    with_vector: WithVector::from(false),
+                                },
+                                None,
+                                None,
+                                &shard_selector,
+                                timeout,
+                                hw_measurement_acc,
+                            )
+                            .await?;
+                        let key_point_ids: HashSet<_> =
+                            records.into_iter().map(|record| record.id).collect();
+                        StorageResult::Ok((shard_key, key_point_ids))
+                    }
+                })
+                .collect();
+
+            let ids_per_key: Vec<(ShardKey, HashSet<PointIdType>)> = lookups.try_collect().await?;
+
+            match Self::split_operation_per_shard_key(&operation, &ids_per_key) {
+                Ok(split) => operations_per_key = split,
+                Err(missed_point_id) => {
+                    return Err(CollectionError::PointNotFound { missed_point_id }.into());
+                }
+            }
+        }
+
+        // Fall back to the previous behavior when there is nothing to split:
+        // non-point-ID operations, operations that can create points, and
+        // empty splits (e.g. deletes of already-gone points, which are a
+        // no-op).
+        if operations_per_key.is_empty() {
+            operations_per_key = shard_keys
+                .into_iter()
+                .map(|shard_key| (shard_key, operation.clone()))
+                .collect();
+        }
+
+        let updates: FuturesUnordered<_> = operations_per_key
             .into_iter()
-            .map(|shard_key| {
+            .map(|(shard_key, operation_for_key)| {
                 collection.update_from_client(
-                    operation.clone(),
+                    operation_for_key,
                     wait,
                     timeout,
                     ordering,
@@ -763,5 +896,132 @@ impl TableOfContent {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+
+    use collection::operations::CollectionUpdateOperations;
+    use segment::types::{Filter, Payload, PointIdType, ShardKey};
+    use shard::operations::payload_ops::{PayloadOps, SetPayloadOp};
+    use shard::operations::point_ops::{PointInsertOperationsInternal, PointOperations};
+
+    use super::TableOfContent;
+
+    fn shard_key(name: &str) -> ShardKey {
+        ShardKey::Keyword(name.into())
+    }
+
+    fn set_payload_op(point_ids: Vec<PointIdType>) -> CollectionUpdateOperations {
+        CollectionUpdateOperations::PayloadOperation(PayloadOps::SetPayload(SetPayloadOp {
+            payload: Payload::default(),
+            points: Some(point_ids),
+            filter: None,
+            key: None,
+        }))
+    }
+
+    /// Regression test for <https://github.com/qdrant/qdrant/issues/10064>.
+    ///
+    /// A `set_payload` request with `points: [9, 101]` and
+    /// `shard_key: ["1", "2"]` must be split so shard key `"1"` only receives
+    /// point `9` and shard key `"2"` only receives point `101`. Dispatching
+    /// the full ID list to every shard key made each replica set report a
+    /// false `No point with id ... found` for the ID owned by the other shard
+    /// key, even though the update had already been applied there.
+    #[test]
+    fn test_split_set_payload_across_shard_keys() {
+        let operation = set_payload_op(vec![PointIdType::NumId(9), PointIdType::NumId(101)]);
+        let ids_per_key = vec![
+            (shard_key("1"), HashSet::from([PointIdType::NumId(9)])),
+            (shard_key("2"), HashSet::from([PointIdType::NumId(101)])),
+        ];
+
+        let split =
+            TableOfContent::split_operation_per_shard_key(&operation, &ids_per_key).unwrap();
+
+        assert_eq!(split.len(), 2);
+        for (key, op) in split {
+            let expected = match &key {
+                ShardKey::Keyword(k) if k.as_str() == "1" => vec![PointIdType::NumId(9)],
+                ShardKey::Keyword(k) if k.as_str() == "2" => {
+                    vec![PointIdType::NumId(101)]
+                }
+                _ => panic!("unexpected shard key {key:?}"),
+            };
+            assert_eq!(
+                op.point_ids(),
+                Some(expected),
+                "shard key {key:?} received foreign point ids"
+            );
+        }
+    }
+
+    /// A point ID that lives in none of the selected shard keys must be
+    /// reported honestly as not found, not hidden behind partial writes.
+    #[test]
+    fn test_missing_point_id_reported_honestly() {
+        let operation = set_payload_op(vec![PointIdType::NumId(9), PointIdType::NumId(404)]);
+        let ids_per_key = vec![(shard_key("1"), HashSet::from([PointIdType::NumId(9)]))];
+
+        let missed =
+            TableOfContent::split_operation_per_shard_key(&operation, &ids_per_key).unwrap_err();
+        assert_eq!(missed, PointIdType::NumId(404));
+    }
+
+    /// Deletes of missing points are a no-op: no honest not-found error and an
+    /// empty split, so the caller can fall back to the previous dispatch.
+    #[test]
+    fn test_delete_points_keeps_noop_for_missing_ids() {
+        let operation = CollectionUpdateOperations::PointOperation(PointOperations::DeletePoints {
+            ids: vec![PointIdType::NumId(404)],
+        });
+        let ids_per_key = vec![(shard_key("1"), HashSet::new())];
+
+        let split =
+            TableOfContent::split_operation_per_shard_key(&operation, &ids_per_key).unwrap();
+        assert!(split.is_empty());
+    }
+
+    /// Filter-based operations have no point IDs to split on: every shard key
+    /// keeps receiving the full operation.
+    #[test]
+    fn test_filter_operation_is_not_split() {
+        let operation = CollectionUpdateOperations::PayloadOperation(
+            PayloadOps::ClearPayloadByFilter(Filter::default()),
+        );
+        let ids_per_key = vec![
+            (shard_key("1"), HashSet::from([PointIdType::NumId(9)])),
+            (shard_key("2"), HashSet::new()),
+        ];
+
+        let split =
+            TableOfContent::split_operation_per_shard_key(&operation, &ids_per_key).unwrap();
+        assert_eq!(split.len(), 2);
+        for (_, op) in split {
+            assert!(matches!(
+                op,
+                CollectionUpdateOperations::PayloadOperation(PayloadOps::ClearPayloadByFilter(_))
+            ));
+        }
+    }
+
+    /// Operations that can create points (upserts) must reach every shard key
+    /// unsplit: a point may legitimately not exist anywhere yet.
+    #[test]
+    fn test_upsert_operation_is_not_split() {
+        let operation = CollectionUpdateOperations::PointOperation(PointOperations::UpsertPoints(
+            PointInsertOperationsInternal::PointsList(Vec::new()),
+        ));
+        let ids_per_key = vec![
+            (shard_key("1"), HashSet::from([PointIdType::NumId(9)])),
+            (shard_key("2"), HashSet::new()),
+        ];
+
+        let split =
+            TableOfContent::split_operation_per_shard_key(&operation, &ids_per_key).unwrap();
+        assert_eq!(split.len(), 2);
     }
 }
