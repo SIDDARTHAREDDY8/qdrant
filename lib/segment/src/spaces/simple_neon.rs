@@ -46,7 +46,13 @@ pub(crate) unsafe fn euclid_similarity_neon(
         for i in 0..n - m {
             result += (*ptr1.add(i) - *ptr2.add(i)).powi(2);
         }
-        -result
+        if result == 0.0 || !result.is_finite() {
+            // The squared sum underflowed to zero (tiny differences) or
+            // overflowed to infinity (large differences); recompute with the
+            // numerically stable scalar implementation.
+            return super::simple::euclid_similarity(v1, v2);
+        }
+        -result.sqrt()
     }
 }
 

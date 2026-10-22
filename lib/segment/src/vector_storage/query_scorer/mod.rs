@@ -179,7 +179,9 @@ mod tests {
         let b = MultiDenseVectorInternal::try_from(vec![vec![3.0, 3.0, 3.0], vec![4.0, 2.0, 1.0]])
             .unwrap();
         let score = score_max_similarity::<f32, EuclidMetric>((&a).into(), (&b).into());
-        // proper value according to theory should be `5.9777255` but we do not apply post-processing step
-        assert_eq!(score, -19.);
+        // Euclidean similarity is the negative distance, so the MaxSim sum is
+        // the negative sum of the per-vector minimal distances:
+        // `-(sqrt(5) + 0 + sqrt(14)) = -5.9777255`.
+        assert!((score - -5.977_725_5).abs() < 1e-6, "score: {score}");
     }
 }

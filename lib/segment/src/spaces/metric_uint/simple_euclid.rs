@@ -59,13 +59,17 @@ pub fn euclid_similarity_bytes(
     v1: &[VectorElementTypeByte],
     v2: &[VectorElementTypeByte],
 ) -> ScoreType {
-    -v1.iter()
+    // Negative Euclidean distance, consistent with the plain `f32`
+    // implementation in `crate::spaces::simple`.
+    let squared_sum: i32 = v1
+        .iter()
         .zip(v2)
         .map(|(a, b)| {
             let diff = i32::from(*a) - i32::from(*b);
             diff * diff
         })
-        .sum::<i32>() as ScoreType
+        .sum();
+    -(squared_sum as ScoreType).sqrt()
 }
 
 #[cfg(test)]

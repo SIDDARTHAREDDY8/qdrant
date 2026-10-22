@@ -63,7 +63,7 @@ pub unsafe fn avx_euclid_similarity_bytes(v1: &[u8], v2: &[u8]) -> f32 {
             score += remainder_score as f32;
         }
 
-        -score
+        -score.sqrt()
     }
 }
 

@@ -60,8 +60,11 @@ pub fn euclid_similarity_half(
     v1: &[VectorElementTypeHalf],
     v2: &[VectorElementTypeHalf],
 ) -> ScoreType {
+    // Negative Euclidean distance, consistent with the plain `f32`
+    // implementation in `crate::spaces::simple`.
     -v1.iter()
         .zip(v2)
         .map(|(a, b)| (f16::to_f32(*a) - f16::to_f32(*b)).powi(2))
         .sum::<f32>()
+        .sqrt()
 }
